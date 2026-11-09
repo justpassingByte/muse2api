@@ -13,6 +13,7 @@ import binascii
 import copy
 import hashlib
 import http.client
+import inspect
 import ipaddress
 import mimetypes
 import math
@@ -737,13 +738,13 @@ class MuseEngine:
             time.sleep(0.1)
         return False
 
-    def reset_thread(self, for_chat: bool = False):
+    def reset_thread(self, for_chat: bool = False, force: bool = False):
         """关闭残留弹窗并确保处于干净会话且 WebSocket 已就绪。
         对于纯文本对话（for_chat=True），若当前热页面无附件、无卡死且气泡数较少，直接复用现有热连接以实现 2s 级秒回。"""
         if not self.page:
             return
         try:
-            needs_nav = self.page.js("""(function(forChat){
+            needs_nav = True if force else self.page.js("""(function(forChat){
                 var d = document.querySelector('[role="dialog"]');
                 if (d) {
                     var b = d.querySelector('button[aria-label*="close" i], button');
@@ -751,7 +752,7 @@ class MuseEngine:
                 }
                 var scope = document.querySelector('main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]') || document.body;
                 var bubbleCount = scope ? scope.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]').length : 0;
-                var hasAtts = document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').length > 0;
+                var hasAtts = document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"], button[aria-label*="remove attachment" i], button[aria-label*="移除附件"], button[aria-label*="删除附件"]').length > 0;
                 var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
                     || document.querySelector('button[aria-label*="Stop" i]')
                     || document.querySelector('button[aria-label*="停止"]'));
@@ -759,7 +760,7 @@ class MuseEngine:
                 var hasStuck = bodyTxt.indexOf('Still sending') !== -1 || bodyTxt.indexOf('Connecting...') !== -1;
                 if (hasStop || hasStuck || hasAtts) return true;
                 if (forChat) {
-                    return bubbleCount >= 24;
+                    return bubbleCount >= 12;
                 }
                 return (window.location.pathname !== '/thread/new') || bubbleCount > 0;
             })(%s)""" % ("true" if for_chat else "false"))
@@ -1461,7 +1462,7 @@ class MuseEngine:
         "return String(n);})()"
     )
     _POLL_CHAT_JS = (
-        "(function(){"
+        "(function(sinceIdx){"
         "var els=[...document.querySelectorAll('*')].filter(function(e){"
         "var s=getComputedStyle(e);"
         "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});"
@@ -1471,11 +1472,16 @@ class MuseEngine:
         "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
         "var nonEmpty=bs.filter(function(b){return ((b.innerText||'').trim().length)>0;});"
-        "var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';"
+        "var txt='';"
+        "if(typeof sinceIdx==='number'&&sinceIdx>=0){"
+        "txt=nonEmpty.slice(sinceIdx).map(function(b){return (b.innerText||'').trim();}).filter(Boolean).join('\\n\\n');"
+        "}else{"
+        "txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';"
+        "}"
         "var stop=!!(document.querySelector('[data-testid=\"hatch-composer-stop-button\"]')"
         "||document.querySelector('button[aria-label*=\"Stop\" i]')"
         "||document.querySelector('button[aria-label*=\"停止\"]'));"
-        "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});})()"
+        "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});})(%s)"
     )
 
     def _agent_text(self) -> str:
@@ -1497,9 +1503,10 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return 0
 
-    def _poll_chat(self) -> tuple[int, str, bool]:
+    def _poll_chat(self, since_idx: int | None = None) -> tuple[int, str, bool]:
         try:
-            raw = self.page.js(self._POLL_CHAT_JS)
+            arg = str(int(since_idx)) if since_idx is not None else "null"
+            raw = self.page.js(self._POLL_CHAT_JS % arg)
             if raw:
                 d = json.loads(raw)
                 return int(d.get("cnt") or 0), (d.get("txt") or "").strip(), bool(d.get("stop"))
@@ -1509,94 +1516,111 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None, final_out: dict | None = None):
+                    stop_event=None, final_out: dict | None = None,
+                    images: list[str] | None = None):
         """发一条消息，流式 yield 增量文本；如传入 final_out，同步写入最新完整 DOM 文本供非流式读取。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
+        refs = [r for r in (images or []) if r]
         self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
-        base_agent, base_text, _ = self._poll_chat()
-        send_status = self._send(prompt)
-        if send_status not in ("clicked", "enter-sent"):
-            unsent = self._composer_unsent()
-            if unsent:
-                raise MuseGenerationError(f"对话提示词发送未确认 ({send_status}, {unsent})")
+        self.reset_thread(for_chat=True, force=len(prompt) > 1500 or bool(refs))
+        upload = self._attach_images(refs) if refs else None
+        try:
+            try:
+                supports_since = len(inspect.signature(self._poll_chat).parameters) >= 1
+            except (TypeError, ValueError):
+                supports_since = False
+            base_agent, base_text, _ = self._poll_chat()
+            def _poll_turn():
+                return self._poll_chat(since_idx=base_agent) if supports_since else self._poll_chat()
+            send_status = self._send(prompt)
+            if send_status not in ("clicked", "enter-sent"):
+                unsent = self._composer_unsent()
+                if unsent:
+                    raise MuseGenerationError(f"对话提示词发送未确认 ({send_status}, {unsent})")
 
-        t_sent = time.time()
-        deadline = t_sent + timeout
-        first_token_timeout = float(getattr(self.cfg, "chat_first_token_timeout", 150) or 150)
-        first_token_deadline = min(deadline, t_sent + first_token_timeout)
-        sent, last, stable = "", None, 0
-        got_first = False
-        last_stop = False
+            t_sent = time.time()
+            deadline = t_sent + timeout
+            first_token_timeout = float(getattr(self.cfg, "chat_first_token_timeout", 150) or 150)
+            first_token_deadline = min(deadline, t_sent + first_token_timeout)
+            sent, last, stable = "", None, 0
+            got_first = False
+            last_stop = False
 
-        # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
-        while time.time() < first_token_deadline:
-            if stop_event is not None and stop_event.is_set():
-                return
-            time.sleep(0.06)
-            cnt, cur, has_stop = self._poll_chat()
-            last_stop = has_stop
-            if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0 and not has_stop:
-                    try:
-                        tail = self.page.js("document.body.innerText.slice(-500)") or ""
-                    except Exception:
-                        tail = ""
-                    if "Still sending" in tail or "Connecting..." in tail:
-                        raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
-                continue
+            # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
+            while time.time() < first_token_deadline:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                time.sleep(0.06)
+                cnt, cur, has_stop = _poll_turn()
+                last_stop = has_stop
+                if not cur or (cnt <= base_agent and cur == base_text):
+                    if time.time() - t_sent > 14.0 and not has_stop:
+                        try:
+                            tail = self.page.js("document.body.innerText.slice(-500)") or ""
+                        except Exception:
+                            tail = ""
+                        if "Still sending" in tail or "Connecting..." in tail:
+                            raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
+                    continue
 
-            if final_out is not None:
-                final_out["text"] = cur
-            delta = cur[len(sent):] if cur.startswith(sent) else cur
-            if delta:
-                sent = cur
-                yield delta
-                last = cur
-                got_first = True
-                break
-
-        if not got_first:
-            unsent = self._composer_unsent()
-            raise MuseGenerationError(
-                f"等待助手首字响应超时 (chars={len(prompt)}, has_stop={last_stop}, unsent={unsent or 'none'})"
-            )
-
-        # 2. 持续捕获增量文本
-        while time.time() < deadline:
-            if stop_event is not None and stop_event.is_set():
-                return
-            time.sleep(0.06)
-            cnt, cur, has_stop = self._poll_chat()
-            if not cur:
-                continue
-
-            if cur != last:
                 if final_out is not None:
                     final_out["text"] = cur
                 delta = cur[len(sent):] if cur.startswith(sent) else cur
                 if delta:
                     sent = cur
                     yield delta
-                last, stable = cur, 0
-            else:
-                stable += 1
-                # Stop 按钮消失说明前端生成彻底结束，连续 4 次（约 0.24s）无新文本即正常退出
-                if not has_stop and stable >= 4:
-                    return
-                # Stop 按钮仍在时允许模型思考，连续 250 次（约 15s）无新文本再退出防卡死
-                if has_stop and stable >= 250:
-                    return
+                    last = cur
+                    got_first = True
+                    break
 
-        raise MuseGenerationError("等待助手回复超时")
+            if not got_first:
+                unsent = self._composer_unsent()
+                raise MuseGenerationError(
+                    f"等待助手首字响应超时 (chars={len(prompt)}, has_stop={last_stop}, unsent={unsent or 'none'})"
+                )
+
+            # 2. 持续捕获增量文本
+            while time.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                time.sleep(0.06)
+                cnt, cur, has_stop = _poll_turn()
+                if not cur:
+                    continue
+
+                if cur != last:
+                    if final_out is not None:
+                        final_out["text"] = cur
+                    delta = cur[len(sent):] if cur.startswith(sent) else cur
+                    if delta:
+                        sent = cur
+                        yield delta
+                    last, stable = cur, 0
+                else:
+                    stable += 1
+                    # Stop 按钮消失说明前端生成彻底结束，连续 4 次（约 0.24s）无新文本即正常退出
+                    if not has_stop and stable >= 4:
+                        return
+                    # Stop 按钮仍在时允许模型思考，连续 250 次（约 15s）无新文本再退出防卡死
+                    if has_stop and stable >= 900:
+                        return
+
+            raise MuseGenerationError("等待助手回复超时")
+        finally:
+            if upload:
+                shutil.rmtree(upload["dir"], ignore_errors=True)
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
-             timeout: int | None = None, account_id: str | None = None) -> str:
+             timeout: int | None = None, account_id: str | None = None,
+             images: list[str] | None = None) -> str:
         """发一条消息，返回完整回复文本（非流式）。"""
         final_out = {}
         out = ""
+        stream_kwargs = {"account_id": account_id, "final_out": final_out}
+        if images:
+            stream_kwargs["images"] = list(images)
         for chunk in self.chat_stream(
-            cookies, prompt, expires, timeout, account_id=account_id, final_out=final_out
+            cookies, prompt, expires, timeout, **stream_kwargs
         ):
             out += chunk
         return final_out.get("text", out)
