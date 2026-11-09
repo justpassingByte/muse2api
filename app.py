@@ -367,7 +367,8 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None,
+                     final_out: dict | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -414,13 +415,16 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         if refreshed:
                             cur_cookies = refreshed["cookies"]
                             cur_exp = refreshed.get("cookies_exp")
+                    if final_out is not None:
+                        final_out.clear()
                     with GEN_LOCK:
                         if stop_event.is_set():
                             return
                         engine.start()
                         for chunk in engine.chat_stream(
                             cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
+                            account_id=cur_id, stop_event=stop_event,
+                            final_out=final_out,
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -496,6 +500,7 @@ class VideoRequest(BaseModel):
     resolution: str | None = None
     timeout: int | None = None
     extra: str | None = None
+    suppress_on_screen_subtitles: bool | None = None
     image: Any = None
     images: list | None = None
     videos: list | None = None
@@ -694,6 +699,7 @@ def _describe_kinds(kinds: list[str]) -> str:
 # muse 不认识这些标记，所以把「标记 -> 第几个附件」写进提示词。
 _KIND_TOKENS = {"image": "图", "video": "视频", "audio": "音频", "document": "文档"}
 _REFERENCE_TOKEN = re.compile(r"\[(?:图|视频|音频|文档)\d+\]")
+_IMAGE_ZERO_TOKEN = re.compile(r"\bImage\s+\d+\b")
 
 
 def _reference_legend(kinds: list[str]) -> str:
@@ -702,6 +708,14 @@ def _reference_legend(kinds: list[str]) -> str:
     for index, kind in enumerate(kinds, 1):
         seen[kind] += 1
         parts.append(f"[{_KIND_TOKENS[kind]}{seen[kind]}] 是第 {index} 个附件（{_KIND_LABELS[kind][1]}）")
+    return "附件对照：" + "，".join(parts)
+
+
+def _image_zero_legend(kinds: list[str]) -> str:
+    parts = [
+        f"Image {index - 1} 是第 {index} 个附件（{_KIND_LABELS[kind][1]}）"
+        for index, kind in enumerate(kinds, 1)
+    ]
     return "附件对照：" + "，".join(parts)
 
 def build_image_prompt(r: ImageRequest, kinds: list[str] | None = None) -> str:
@@ -714,6 +728,8 @@ def build_image_prompt(r: ImageRequest, kinds: list[str] | None = None) -> str:
                  f"进行生图/编辑，输出一张图片：{r.prompt.strip()}"]
     elif len(refs) > 1 and _REFERENCE_TOKEN.search(r.prompt):
         parts = [f"基于我本次上传附带的参考图片（{_reference_legend(kinds)}）进行生图/编辑：{r.prompt.strip()}"]
+    elif len(refs) > 1 and _IMAGE_ZERO_TOKEN.search(r.prompt):
+        parts = [f"基于我本次上传附带的参考图片（{_image_zero_legend(kinds)}）进行生图/编辑：{r.prompt.strip()}"]
     elif has_ref:
         parts = [f"基于我本次上传附带的参考图片进行生图/编辑：{r.prompt.strip()}"]
     else:
@@ -956,6 +972,10 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
         reference_instruction = (
             f"基于我本次上传的 {len(refs)} 张参考图片生成视频（{_reference_legend(kinds)}；"
             "各图片的用途以下面的描述为准，未说明时以第一张作为主要起始画面；严禁使用历史图片或其他图像）")
+    elif len(refs) > 1 and _IMAGE_ZERO_TOKEN.search(user_prompt):
+        reference_instruction = (
+            f"基于我本次上传的 {len(refs)} 张参考图片生成视频（{_image_zero_legend(kinds)}；"
+            "各图片的用途以下面的描述为准，未说明时以第一张作为主要起始画面；严禁使用历史图片或其他图像）")
     elif len(refs) > 1:
         reference_instruction = (
             f"基于我本次上传的 {len(refs)} 张参考图片生成视频（以第一张作为主要起始画面，"
@@ -987,6 +1007,14 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
 
     if r.resolution:
         parts.append(f"画质规格：{r.resolution}")
+    if r.suppress_on_screen_subtitles:
+        parts.append(
+            "【画面纯净与音画分离规范】：全程输出绝对纯净、零文字的全屏动画画面"
+            "（clean textless borderless anime visuals, unobstructed image margins）。"
+            "若上文包含旁白或人物台词，仅用于合成日语语音配音音轨与环境音效（audio-only spoken voiceover and SFX track），"
+            "切勿把任何台词文本或旁白文字以视觉文字形式呈现在屏幕上；"
+            "调用生视频工具生成画面提示词时，请只保留纯视觉动作、镜头与光影描述，并保持画面彻底无字"
+        )
     if r.extra:
         parts.append(r.extra)
     return "，".join(parts)
@@ -1671,7 +1699,9 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        final_out: dict[str, str] = {}
+        joined = "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, final_out=final_out))
+        return final_out.get("text", joined)
 
     try:
         text = await asyncio.to_thread(run)
@@ -1807,7 +1837,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        final_out: dict[str, str] = {}
+        joined = "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, final_out=final_out))
+        return final_out.get("text", joined)
 
     try:
         text = await asyncio.to_thread(run)
@@ -2501,7 +2533,23 @@ def get_keepalive_status(_=Depends(auth)):
 
 
 # ------------------------- 仓库实时更新检测、通知与一键在线升级 -------------------------
-REPO_URL = "https://github.com/czg86389-hub/muse2api"
+_DEFAULT_MUSE2API_REPO = "justpassingByte/muse2api"
+
+
+def _normalize_repo_slug(value: str) -> str:
+    slug = (value or "").strip()
+    for prefix in ("https://github.com/", "http://github.com/"):
+        if slug.startswith(prefix):
+            slug = slug[len(prefix):]
+            break
+    if slug.endswith(".git"):
+        slug = slug[:-4]
+    slug = slug.strip("/")
+    return slug if "/" in slug else _DEFAULT_MUSE2API_REPO
+
+
+MUSE2API_REPO = _normalize_repo_slug(os.environ.get("MUSE2API_REPO", _DEFAULT_MUSE2API_REPO))
+REPO_URL = f"https://github.com/{MUSE2API_REPO}"
 TRACKED_REPO_PATHS = [
     "app.py", "engine.py", "store.py", "cdp.py", "config.py", "proxy.py",
     "admin.html", "README.md", "version.json", "requirements.txt",
@@ -2557,10 +2605,19 @@ def _git(args: list[str], timeout: int = 30):
     )
 
 
+def _repo_slug() -> str:
+    return _normalize_repo_slug(MUSE2API_REPO)
+
+
+def _repo_url() -> str:
+    return f"https://github.com/{_repo_slug()}"
+
+
 def _ensure_git_repo(token: str = ""):
-    """确保 BASE_DIR 已初始化为绑定 czg86389-hub/muse2api 的 Git 仓库。"""
+    """确保 BASE_DIR 已初始化为绑定配置源 GitHub 仓库的 Git 仓库。"""
+    slug = _repo_slug()
     git_dir = os.path.join(BASE_DIR, ".git")
-    remote_url = f"https://x-access-token:{token}@github.com/czg86389-hub/muse2api.git" if token else f"{REPO_URL}.git"
+    remote_url = f"https://x-access-token:{token}@github.com/{slug}.git" if token else f"https://github.com/{slug}.git"
     if not os.path.isdir(git_dir):
         _git(["init", "-b", "main"])
         _git(["remote", "add", "origin", remote_url])
@@ -2568,8 +2625,13 @@ def _ensure_git_repo(token: str = ""):
         _git(["reset", "--mixed", "origin/main"])
     else:
         _git(["remote", "set-url", "origin", remote_url])
-    _git(["config", "user.name", "czg86389-hub"])
-    _git(["config", "user.email", "czg86389-hub@users.noreply.github.com"])
+    name_res = _git(["config", "user.name"])
+    if name_res.returncode != 0 or not name_res.stdout.strip():
+        _git(["config", "user.name", slug.split("/", 1)[0]])
+    email_res = _git(["config", "user.email"])
+    if email_res.returncode != 0 or not email_res.stdout.strip():
+        owner = slug.split("/", 1)[0]
+        _git(["config", "user.email", f"{owner}@users.noreply.github.com"])
 
 
 def _check_update_sync(force: bool = False) -> dict:
@@ -2611,7 +2673,7 @@ def _check_update_sync(force: bool = False) -> dict:
     highlights_en = list(local_ver_obj.get("highlights_en") or [])
     try:
         rv = requests.get(
-            f"https://raw.githubusercontent.com/czg86389-hub/muse2api/main/version.json?t={int(now)}",
+            f"https://raw.githubusercontent.com/{_repo_slug()}/main/version.json?t={int(now)}",
             timeout=6,
         )
         if rv.status_code == 200:
@@ -2633,7 +2695,7 @@ def _check_update_sync(force: bool = False) -> dict:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         resp = requests.get(
-            "https://api.github.com/repos/czg86389-hub/muse2api/commits?sha=main&per_page=5",
+            f"https://api.github.com/repos/{_repo_slug()}/commits?sha=main&per_page=5",
             headers=headers,
             timeout=6,
         )
@@ -2643,7 +2705,7 @@ def _check_update_sync(force: bool = False) -> dict:
                 sha7 = (c.get("sha") or "")[:7]
                 c_msg = ((c.get("commit") or {}).get("message") or "").splitlines()[0]
                 c_date = (((c.get("commit") or {}).get("committer") or {}).get("date") or "")
-                c_url = c.get("html_url") or f"{REPO_URL}/commit/{sha7}"
+                c_url = c.get("html_url") or f"{_repo_url()}/commit/{sha7}"
                 if idx == 0:
                     remote_sha = sha7
                     remote_msg = c_msg
@@ -2679,7 +2741,7 @@ def _check_update_sync(force: bool = False) -> dict:
         has_update = _parse_v(remote_version) > _parse_v(local_version)
 
     data = {
-        "repo_url": REPO_URL,
+        "repo_url": _repo_url(),
         "has_git": has_git,
         "local_version": local_version,
         "remote_version": remote_version,
@@ -2720,7 +2782,7 @@ def _upgrade_from_github_sync() -> dict:
 
     if not upgraded_via:
         resp = requests.get(
-            "https://codeload.github.com/czg86389-hub/muse2api/tar.gz/refs/heads/main",
+            f"https://codeload.github.com/{_repo_slug()}/tar.gz/refs/heads/main",
             timeout=60,
         )
         if resp.status_code != 200:

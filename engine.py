@@ -385,7 +385,19 @@ class MuseEngine:
                         pass
 
             os.makedirs(self.cfg.data_dir, exist_ok=True)
-            self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
+            if self._log is not None:
+                try:
+                    self._log.close()
+                except Exception:
+                    pass
+                self._log = None
+            log_path = os.path.join(self.cfg.data_dir, "chromium.log")
+            try:
+                if os.path.isfile(log_path) and os.path.getsize(log_path) > 20 * 1024 * 1024:
+                    os.replace(log_path, log_path + ".1")
+            except OSError:
+                pass
+            self._log = open(log_path, "ab", buffering=0)
             cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
             self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
                                          env=env, cwd=cwd_dir)
@@ -398,41 +410,65 @@ class MuseEngine:
                 except Exception as exc:  # noqa: BLE001
                     last = exc
                     time.sleep(1)
+            if self.proc and self.proc.poll() is None:
+                try:
+                    self.proc.terminate()
+                    self.proc.wait(timeout=5)
+                except Exception:  # noqa: BLE001
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+            self.proc = None
+            if self._log is not None:
+                try:
+                    self._log.close()
+                except Exception:
+                    pass
+                self._log = None
             raise MuseGenerationError(f"Chromium 启动失败: {last}")
 
     def stop(self):
         with self._start_lock:
-            self._close_page()
-            if self.browser:
+            try:
+                self._close_page()
+                if self.browser:
+                    with self._contexts_lock:
+                        for ctx_id in list(self._active_contexts):
+                            try:
+                                self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
+                            except Exception:
+                                pass
+                        self._active_contexts.clear()
+                    try:
+                        self.browser.close()
+                    except Exception:
+                        pass
+                    self.browser = None
+                if self.proc and self.proc.poll() is None:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=10)
+                    except Exception:  # noqa: BLE001
+                        self.proc.kill()
+                self.proc = None
                 with self._contexts_lock:
-                    for ctx_id in list(self._active_contexts):
-                        try:
-                            self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
-                        except Exception:
-                            pass
-                    self._active_contexts.clear()
-                try:
-                    self.browser.close()
-                except Exception:
-                    pass
-                self.browser = None
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=10)
-                except Exception:  # noqa: BLE001
-                    self.proc.kill()
-            self.proc = None
-            with self._contexts_lock:
-                relays = list(self._proxy_relays)
-                self._proxy_relays.clear()
-            for relay in relays:
-                relay.close()
-            with self._contexts_lock:
-                download_dirs = list(self._download_dirs)
-                self._download_dirs.clear()
-            for directory in download_dirs:
-                shutil.rmtree(directory, ignore_errors=True)
+                    relays = list(self._proxy_relays)
+                    self._proxy_relays.clear()
+                for relay in relays:
+                    relay.close()
+                with self._contexts_lock:
+                    download_dirs = list(self._download_dirs)
+                    self._download_dirs.clear()
+                for directory in download_dirs:
+                    shutil.rmtree(directory, ignore_errors=True)
+            finally:
+                if self._log is not None:
+                    try:
+                        self._log.close()
+                    except Exception:
+                        pass
+                    self._log = None
 
     # ---------------- 页面 ----------------
     @property
@@ -1473,19 +1509,25 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
-        """发一条消息，流式 yield 增量文本。"""
+                    stop_event=None, final_out: dict | None = None):
+        """发一条消息，流式 yield 增量文本；如传入 final_out，同步写入最新完整 DOM 文本供非流式读取。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
         self.reset_thread(for_chat=True)
         base_agent, base_text, _ = self._poll_chat()
-        self._send(prompt)
+        send_status = self._send(prompt)
+        if send_status not in ("clicked", "enter-sent"):
+            unsent = self._composer_unsent()
+            if unsent:
+                raise MuseGenerationError(f"对话提示词发送未确认 ({send_status}, {unsent})")
 
         t_sent = time.time()
         deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + 40.0)
+        first_token_timeout = float(getattr(self.cfg, "chat_first_token_timeout", 150) or 150)
+        first_token_deadline = min(deadline, t_sent + first_token_timeout)
         sent, last, stable = "", None, 0
         got_first = False
+        last_stop = False
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
         while time.time() < first_token_deadline:
@@ -1493,8 +1535,9 @@ class MuseEngine:
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
+            last_stop = has_stop
             if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
+                if time.time() - t_sent > 14.0 and not has_stop:
                     try:
                         tail = self.page.js("document.body.innerText.slice(-500)") or ""
                     except Exception:
@@ -1503,6 +1546,8 @@ class MuseEngine:
                         raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
                 continue
 
+            if final_out is not None:
+                final_out["text"] = cur
             delta = cur[len(sent):] if cur.startswith(sent) else cur
             if delta:
                 sent = cur
@@ -1512,7 +1557,10 @@ class MuseEngine:
                 break
 
         if not got_first:
-            raise MuseGenerationError("等待助手首字响应超时")
+            unsent = self._composer_unsent()
+            raise MuseGenerationError(
+                f"等待助手首字响应超时 (chars={len(prompt)}, has_stop={last_stop}, unsent={unsent or 'none'})"
+            )
 
         # 2. 持续捕获增量文本
         while time.time() < deadline:
@@ -1524,6 +1572,8 @@ class MuseEngine:
                 continue
 
             if cur != last:
+                if final_out is not None:
+                    final_out["text"] = cur
                 delta = cur[len(sent):] if cur.startswith(sent) else cur
                 if delta:
                     sent = cur
@@ -1531,11 +1581,11 @@ class MuseEngine:
                 last, stable = cur, 0
             else:
                 stable += 1
-                # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
-                if not has_stop and stable >= 3:
+                # Stop 按钮消失说明前端生成彻底结束，连续 4 次（约 0.24s）无新文本即正常退出
+                if not has_stop and stable >= 4:
                     return
-                # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
-                if has_stop and stable >= 80:
+                # Stop 按钮仍在时允许模型思考，连续 250 次（约 15s）无新文本再退出防卡死
+                if has_stop and stable >= 250:
                     return
 
         raise MuseGenerationError("等待助手回复超时")
@@ -1543,10 +1593,13 @@ class MuseEngine:
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
              timeout: int | None = None, account_id: str | None = None) -> str:
         """发一条消息，返回完整回复文本（非流式）。"""
+        final_out = {}
         out = ""
-        for chunk in self.chat_stream(cookies, prompt, expires, timeout, account_id=account_id):
+        for chunk in self.chat_stream(
+            cookies, prompt, expires, timeout, account_id=account_id, final_out=final_out
+        ):
             out += chunk
-        return out
+        return final_out.get("text", out)
 
     def extract_bytes(self, src: str, expect: str = "image", retries: int = 4):
         last = "未知"

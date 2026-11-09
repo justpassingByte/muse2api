@@ -108,6 +108,12 @@ with tempfile.TemporaryDirectory() as home:
     assert "[视频1] 是第 1 个附件（视频）" in image_prompt
     image_tokens = app.build_image_prompt(app.ImageRequest(prompt="[图1] 穿上 [图2] 的衣服", images=["a", "b"]), ["image", "image"])
     assert "附件对照：[图1] 是第 1 个附件（图片），[图2] 是第 2 个附件（图片）" in image_tokens
+    image_zero_img = app.build_image_prompt(app.ImageRequest(prompt="Image 0: Alice. Image 1: BG.", images=["a", "b"]), ["image", "image"])
+    assert "附件对照：Image 0 是第 1 个附件（图片），Image 1 是第 2 个附件（图片）" in image_zero_img
+    image_zero_vid = app.build_video_prompt(app.VideoRequest(prompt="Move Image 0 into Image 1", images=["a", "b"]), ["image", "image"])
+    assert "附件对照：Image 0 是第 1 个附件（图片），Image 1 是第 2 个附件（图片）" in image_zero_vid
+    clean_vid = app.build_video_prompt(app.VideoRequest(prompt="A sleeping cat", image="i", suppress_on_screen_subtitles=True))
+    assert "画面纯净与音画分离规范" in clean_vid and "textless borderless" in clean_vid
     legacy = app.build_video_prompt(app.VideoRequest(prompt="x", image="i"))
     assert "第一帧参考图" in legacy
     print("PASS: ordered media fields, count limit and media-aware prompts")
